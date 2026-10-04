@@ -30,9 +30,11 @@ mkdir -p "$ROOT/build"
 
 APP="$ROOT/build/SoundSync.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/build/SoundSync.bin" "$APP/Contents/MacOS/SoundSync"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/Resources/SoundSync.icns" "$APP/Contents/Resources/SoundSync.icns"
+cp "$ROOT/Resources/MenuBarIcon.png" "$APP/Contents/Resources/MenuBarIcon.png"
 codesign --force --sign - "$APP" >/dev/null
 echo "built $APP"
 

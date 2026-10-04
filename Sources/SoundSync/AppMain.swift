@@ -9,7 +9,7 @@ enum SoundSyncMain {
         let delegate = AppDelegate()
         retainedDelegate = delegate
         app.delegate = delegate
-        app.setActivationPolicy(.regular)
+        app.setActivationPolicy(.accessory)
         app.run()
     }
 }

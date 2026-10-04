@@ -27,43 +27,57 @@ enum ToneSplit {
         return BandLevel(low: raw.low - mean, mid: raw.mid - mean, high: raw.high - mean)
     }
 
-    /// Turn down a band on the speaker that is weaker there. Never boost, so a small driver is not asked to play what it cannot.
-    static func assignment(pulse: BandLevel, sony: BandLevel) -> (pulse: BandCut, sony: BandCut) {
-        func cut(_ stronger: Float, _ weaker: Float) -> Float {
-            let gap = stronger - weaker
-            guard gap > 3 else { return 0 }
-            return max(-8, -0.5 * (gap - 3))
-        }
-        return (
-            BandCut(
-                lowDB: cut(sony.low, pulse.low),
-                midDB: cut(sony.mid, pulse.mid),
-                highDB: cut(sony.high, pulse.high)
-            ),
-            BandCut(
-                lowDB: cut(pulse.low, sony.low),
-                midDB: cut(pulse.mid, sony.mid),
-                highDB: cut(pulse.high, sony.high)
-            )
-        )
-    }
-
-    static func summary(pulse: BandCut, sony: BandCut) -> String {
-        var parts: [String] = []
-        func mention(_ label: String, pulseCut: Float, sonyCut: Float) {
-            if sonyCut < pulseCut - 0.4 {
-                parts.append("The Pulse 4 is carrying more of the \(label).")
-            } else if pulseCut < sonyCut - 0.4 {
-                parts.append("The SRS-XB13 is carrying more of the \(label).")
+    /// Turn down a band on every speaker that is weaker than the strongest one there. Never boost.
+    static func cuts(for levels: [BandLevel]) -> [BandCut] {
+        func band(_ values: [Float]) -> [Float] {
+            guard let strongest = values.max() else { return Array(repeating: 0, count: values.count) }
+            return values.map { value in
+                let gap = strongest - value
+                guard gap > 3 else { return 0 }
+                return max(-8, -0.5 * (gap - 3))
             }
         }
-        mention("lows", pulseCut: pulse.lowDB, sonyCut: sony.lowDB)
-        mention("mids", pulseCut: pulse.midDB, sonyCut: sony.midDB)
-        mention("highs", pulseCut: pulse.highDB, sonyCut: sony.highDB)
+        let low = band(levels.map(\.low))
+        let mid = band(levels.map(\.mid))
+        let high = band(levels.map(\.high))
+        return (0..<levels.count).map { index in
+            BandCut(lowDB: low[index], midDB: mid[index], highDB: high[index])
+        }
+    }
+
+    static func summary(names: [String], cuts: [BandCut]) -> String {
+        guard names.count == cuts.count, names.count >= 2 else { return "" }
+        var parts: [String] = []
+        func mention(_ label: String, _ values: [Float]) {
+            guard let best = values.max() else { return }
+            let leaders = zip(names, values).compactMap { name, value in
+                value >= best - 0.4 ? name : nil
+            }
+            let weaker = values.contains { $0 < best - 0.4 }
+            guard weaker, !leaders.isEmpty else { return }
+            if leaders.count == 1 {
+                parts.append("\(leaders[0]) is carrying more of the \(label).")
+            } else {
+                parts.append("\(list(leaders)) are carrying more of the \(label).")
+            }
+        }
+        mention("lows", cuts.map(\.lowDB))
+        mention("mids", cuts.map(\.midDB))
+        mention("highs", cuts.map(\.highDB))
         if parts.isEmpty {
-            return "Their tone is close, so both play the full range."
+            return "Their tone is close, so every speaker plays the full range."
         }
         return parts.joined(separator: " ")
+    }
+
+    private static func list(_ names: [String]) -> String {
+        switch names.count {
+        case 0: return ""
+        case 1: return names[0]
+        case 2: return "\(names[0]) and \(names[1])"
+        default:
+            return names.dropLast().joined(separator: ", ") + ", and " + names[names.count - 1]
+        }
     }
 
     private static func energies(samples: [Float], sampleRate: Double) -> BandLevel {

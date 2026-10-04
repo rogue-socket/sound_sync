@@ -10,27 +10,25 @@ final class AppModel: ObservableObject {
     @Published var isCalibrating = false
     @Published var status = "Off"
     @Published var detail = "Sync is measured at the Mac. Put the laptop where you are listening, in a quiet room."
-    @Published var pulseVolume: Double
-    @Published var sonyVolume: Double
+    @Published var speakers: [SpeakerRecord] = []
+    @Published var available: [DiscoveredSpeaker] = []
     @Published var macVolume: Double = 1
     @Published var toneEnabled: Bool
-    @Published var pulseCut = BandCut.flat
-    @Published var sonyCut = BandCut.flat
+    @Published var toneMeasured: Bool
 
     private let engine = Engine()
     private var run: Task<Void, Never>?
 
     init() {
         let defaults = UserDefaults.standard
-        pulseVolume = defaults.object(forKey: Store.pulseVolume) as? Double ?? 0.8
-        sonyVolume = defaults.object(forKey: Store.sonyVolume) as? Double ?? 1.0
         if defaults.object(forKey: Store.toneEnabled) == nil {
             toneEnabled = true
         } else {
             toneEnabled = defaults.bool(forKey: Store.toneEnabled)
         }
-        pulseCut = Self.storedCut(prefix: "pulse")
-        sonyCut = Self.storedCut(prefix: "sony")
+        toneMeasured = defaults.bool(forKey: Store.toneMeasured)
+        speakers = SpeakerLibrary.load()
+        available = SpeakerLibrary.available(excluding: speakers)
         OutputRestore.recoverIfNeeded()
         engine.onMasterVolume = { value in
             Task { @MainActor in
@@ -52,16 +50,44 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func setPulseVolume(_ value: Double) {
-        pulseVolume = value
-        UserDefaults.standard.set(value, forKey: Store.pulseVolume)
-        engine.setGains(pulse: Float(value), sony: Float(sonyVolume))
+    func refreshSpeakers() {
+        guard !isOn, !isBusy, !isCalibrating else { return }
+        speakers = SpeakerLibrary.applyingDiscovery(speakers)
+        available = SpeakerLibrary.available(excluding: speakers)
+        SpeakerLibrary.save(speakers)
     }
 
-    func setSonyVolume(_ value: Double) {
-        sonyVolume = value
-        UserDefaults.standard.set(value, forKey: Store.sonyVolume)
-        engine.setGains(pulse: Float(pulseVolume), sony: Float(value))
+    func addSpeaker(_ device: DiscoveredSpeaker) {
+        guard !isOn, !isBusy, !isCalibrating else { return }
+        guard !speakers.contains(where: { $0.id == device.id || SpeakerNames.match($0.name, device.name) }) else { return }
+        speakers.append(SpeakerRecord(
+            id: device.id,
+            name: device.name,
+            address: device.address,
+            included: true,
+            volume: 0.8,
+            delay: 0,
+            lowDB: 0,
+            midDB: 0,
+            highDB: 0,
+            available: device.connected
+        ))
+        available.removeAll { $0.id == device.id || SpeakerNames.match($0.name, device.name) }
+        SpeakerLibrary.save(speakers)
+    }
+
+    func removeSpeaker(_ id: String) {
+        guard !isOn, !isBusy, !isCalibrating else { return }
+        speakers.removeAll { $0.id == id }
+        available = SpeakerLibrary.available(excluding: speakers)
+        SpeakerLibrary.save(speakers)
+    }
+
+    func setVolume(_ id: String, _ value: Double) {
+        guard let index = speakers.firstIndex(where: { $0.id == id }) else { return }
+        speakers[index].volume = value
+        SpeakerLibrary.save(speakers)
+        engine.setGain(id: id, gain: Float(value))
     }
 
     func setToneEnabled(_ enabled: Bool) {
@@ -74,7 +100,7 @@ final class AppModel: ObservableObject {
         guard isOn, !isCalibrating else { return }
         isCalibrating = true
         status = "Checking speakers"
-        detail = "Looking for the Pulse 4 and the SRS-XB13."
+        detail = "Looking for the speakers you added."
         Task {
             do {
                 try engine.requireConnectedSpeakers()
@@ -98,20 +124,18 @@ final class AppModel: ObservableObject {
                         self.detail = detail
                     }
                 }
-                Self.store(result.pulseCut, prefix: "pulse")
-                Self.store(result.sonyCut, prefix: "sony")
-                pulseCut = result.pulseCut
-                sonyCut = result.sonyCut
+                for measurement in result.speakers {
+                    guard let index = speakers.firstIndex(where: { $0.id == measurement.id }) else { continue }
+                    speakers[index].delay = measurement.delay
+                    speakers[index].lowDB = measurement.cut.lowDB
+                    speakers[index].midDB = measurement.cut.midDB
+                    speakers[index].highDB = measurement.cut.highDB
+                }
+                toneMeasured = true
                 UserDefaults.standard.set(true, forKey: Store.toneMeasured)
-                UserDefaults.standard.set(result.pulseDelay, forKey: Store.pulseDelay)
-                UserDefaults.standard.set(result.sonyDelay, forKey: Store.sonyDelay)
+                SpeakerLibrary.save(speakers)
                 status = "On"
-                detail = Self.statusText(
-                    pulseDelay: result.pulseDelay,
-                    sonyDelay: result.sonyDelay,
-                    pulseCut: result.pulseCut,
-                    sonyCut: result.sonyCut
-                )
+                detail = statusText()
             } catch {
                 status = "Calibration failed"
                 detail = error.localizedDescription
@@ -132,34 +156,24 @@ final class AppModel: ObservableObject {
 
     private func turnOn() {
         guard !isBusy else { return }
+        let chosen = speakers.filter(\.included)
+        guard chosen.count >= 2 else {
+            status = "Pick speakers"
+            detail = "Check at least two speakers. Sync needs more than one."
+            return
+        }
         isBusy = true
-        status = "Connecting both speakers…"
-        detail = "Turn the Pulse 4 and the SRS-XB13 on."
-        let pulse = Float(pulseVolume)
-        let sony = Float(sonyVolume)
-        let pulseDelay = UserDefaults.standard.double(forKey: Store.pulseDelay)
-        let sonyDelay = UserDefaults.standard.double(forKey: Store.sonyDelay)
-        let pulseCut = Self.storedCut(prefix: "pulse")
-        let sonyCut = Self.storedCut(prefix: "sony")
-        let recheck = UserDefaults.standard.bool(forKey: Store.toneMeasured)
-            || pulseDelay != 0
-            || sonyDelay != 0
+        status = "Connecting speakers…"
+        detail = "Turn on \(SpeakerNames.list(chosen.map(\.name)))."
+        let recheck = toneMeasured || chosen.contains { $0.delay != 0 }
+        let setups = chosen.map { $0.setup() }
         run = Task {
             do {
-                try await engine.start(
-                    pulseGain: pulse,
-                    sonyGain: sony,
-                    pulseDelay: pulseDelay,
-                    sonyDelay: sonyDelay,
-                    pulseCut: pulseCut,
-                    sonyCut: sonyCut,
-                    toneEnabled: toneEnabled,
-                    silenceRecheck: recheck
-                )
+                try await engine.start(setups, toneEnabled: toneEnabled, silenceRecheck: recheck)
                 isOn = true
                 isBusy = false
                 status = "On"
-                detail = Self.statusText(pulseDelay: pulseDelay, sonyDelay: sonyDelay, pulseCut: pulseCut, sonyCut: sonyCut)
+                detail = statusText()
             } catch {
                 engine.stop()
                 isOn = false
@@ -170,41 +184,35 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private static func statusText(pulseDelay: Double, sonyDelay: Double, pulseCut: BandCut, sonyCut: BandCut) -> String {
-        var text = delayText(pulse: pulseDelay, sony: sonyDelay)
-        if UserDefaults.standard.bool(forKey: Store.toneMeasured) {
-            text += " " + ToneSplit.summary(pulse: pulseCut, sony: sonyCut)
+    private func statusText() -> String {
+        let chosen = speakers.filter(\.included)
+        var text = Self.delayText(chosen)
+        if toneMeasured {
+            let summary = ToneSplit.summary(names: chosen.map(\.name), cuts: chosen.map(\.cut))
+            if !summary.isEmpty {
+                text += " " + summary
+            }
         }
         return text
     }
 
-    private static func storedCut(prefix: String) -> BandCut {
-        let defaults = UserDefaults.standard
-        guard defaults.bool(forKey: Store.toneMeasured) else { return .flat }
-        return BandCut(
-            lowDB: Float(defaults.double(forKey: "\(prefix)LowDB")),
-            midDB: Float(defaults.double(forKey: "\(prefix)MidDB")),
-            highDB: Float(defaults.double(forKey: "\(prefix)HighDB"))
-        )
-    }
-
-    private static func store(_ cut: BandCut, prefix: String) {
-        let defaults = UserDefaults.standard
-        defaults.set(Double(cut.lowDB), forKey: "\(prefix)LowDB")
-        defaults.set(Double(cut.midDB), forKey: "\(prefix)MidDB")
-        defaults.set(Double(cut.highDB), forKey: "\(prefix)HighDB")
-    }
-
-    private static func delayText(pulse: Double, sony: Double) -> String {
-        let pulseMs = Int((pulse * 1000).rounded())
-        let sonyMs = Int((sony * 1000).rounded())
-        if pulseMs == 0 && sonyMs == 0 {
+    private static func delayText(_ speakers: [SpeakerRecord]) -> String {
+        let delays = speakers.map { ($0.name, Int(($0.delay * 1000).rounded())) }
+        if delays.allSatisfy({ $0.1 == 0 }) {
             return "Not calibrated yet. Press Calibrate while the room is quiet."
         }
-        if pulseMs >= sonyMs {
-            return "Delaying the Pulse 4 by \(pulseMs) ms so it matches the SRS-XB13."
+        let anchors = delays.filter { $0.1 == 0 }.map(\.0)
+        let delayed = delays.filter { $0.1 > 0 }.map { "\($0.0) by \($0.1) ms" }
+        let anchor: String
+        if anchors.count == 1 {
+            anchor = anchors[0]
+        } else if anchors.isEmpty {
+            anchor = "the slowest speaker"
+        } else {
+            anchor = "the others"
         }
-        return "Delaying the SRS-XB13 by \(sonyMs) ms so it matches the Pulse 4."
+        let verb = delayed.count == 1 ? "it matches" : "they match"
+        return "Delaying \(SpeakerNames.list(delayed)) so \(verb) \(anchor)."
     }
 
     private func handle(_ notice: EngineNotice) {
@@ -212,12 +220,15 @@ final class AppModel: ObservableObject {
         switch notice {
         case .rechecking:
             status = "Rechecking delay"
-            detail = "Playback is quiet, so Sound Sync is measuring both speakers again."
-        case .delaysUpdated(let pulseDelay, let sonyDelay):
-            UserDefaults.standard.set(pulseDelay, forKey: Store.pulseDelay)
-            UserDefaults.standard.set(sonyDelay, forKey: Store.sonyDelay)
+            detail = "Playback is quiet, so Sound Sync is measuring the speakers again."
+        case .delaysUpdated(let updates):
+            for update in updates {
+                guard let index = speakers.firstIndex(where: { $0.id == update.id }) else { continue }
+                speakers[index].delay = update.delay
+            }
+            SpeakerLibrary.save(speakers)
             status = "On"
-            detail = Self.statusText(pulseDelay: pulseDelay, sonyDelay: sonyDelay, pulseCut: pulseCut, sonyCut: sonyCut)
+            detail = statusText()
         case .recheckFailed(let message):
             status = "Delay check failed"
             detail = message
@@ -250,87 +261,145 @@ struct ControlView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack {
-                Text("Sound Sync")
-                    .font(.headline)
-                Spacer()
-                Toggle("On", isOn: Binding(
-                    get: { model.isOn },
-                    set: { _ in model.toggle() }
-                ))
-                .labelsHidden()
-                .disabled(model.isBusy || model.isCalibrating)
-            }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Text("Sound Sync")
+                        .font(.headline)
+                    Spacer()
+                    Toggle("On", isOn: Binding(
+                        get: { model.isOn },
+                        set: { _ in model.toggle() }
+                    ))
+                    .labelsHidden()
+                    .disabled(model.isBusy || model.isCalibrating)
+                }
 
-            Text(model.status)
-                .font(.subheadline.weight(.semibold))
-            Text(model.detail)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if model.isOn {
-                Text(model.macVolume == 0
-                    ? "Mac volume is muted. The volume keys control both speakers."
-                    : "Mac volume \(Int((model.macVolume * 100).rounded()))%. The volume keys control both speakers.")
+                Text(model.status)
+                    .font(.subheadline.weight(.semibold))
+                Text(model.detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-            }
 
-            volume("JBL Pulse 4", value: model.pulseVolume, set: model.setPulseVolume)
-            volume("Sony SRS-XB13", value: model.sonyVolume, set: model.setSonyVolume)
+                if model.isOn {
+                    Text(model.macVolume == 0
+                        ? "Mac volume is muted. The volume keys control every speaker."
+                        : "Mac volume \(Int((model.macVolume * 100).rounded()))%. The volume keys control every speaker.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
-            if UserDefaults.standard.bool(forKey: Store.toneMeasured) {
-                Toggle("Tone split", isOn: Binding(
-                    get: { model.toneEnabled },
-                    set: { model.setToneEnabled($0) }
-                ))
+                HStack {
+                    Text("Speakers")
+                        .font(.callout.weight(.semibold))
+                    Spacer()
+                    Menu("Add speaker") {
+                        if model.available.isEmpty {
+                            Button("No other Bluetooth devices") {}
+                                .disabled(true)
+                        } else {
+                            ForEach(model.available) { device in
+                                Button(device.connected ? device.name : "\(device.name) — not connected") {
+                                    model.addSpeaker(device)
+                                }
+                            }
+                        }
+                    }
+                    .disabled(model.isOn || model.isBusy || model.isCalibrating)
+                    Button("Refresh") {
+                        model.refreshSpeakers()
+                    }
+                    .disabled(model.isOn || model.isBusy || model.isCalibrating)
+                }
+
+                Text(model.isOn
+                    ? "Turn Sound Sync off to add or remove speakers."
+                    : "Add speakers from the Bluetooth devices that are paired or connected. At least two.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if model.speakers.isEmpty {
+                    Text("No speakers added yet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(model.speakers) { speaker in
+                        speakerRow(speaker)
+                    }
+                }
+
+                if model.toneMeasured {
+                    Toggle("Tone split", isOn: Binding(
+                        get: { model.toneEnabled },
+                        set: { model.setToneEnabled($0) }
+                    ))
+                    .disabled(!model.isOn || model.isCalibrating)
+                    ForEach(model.speakers.filter(\.included)) { speaker in
+                        Text(Self.cutsLine(speaker.name, speaker.cut))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Button(model.isCalibrating ? "Calibrating…" : "Calibrate") {
+                    model.calibrate()
+                }
                 .disabled(!model.isOn || model.isCalibrating)
-                Text(Self.cutsLine("Pulse 4", model.pulseCut))
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                Text(Self.cutsLine("SRS-XB13", model.sonyCut))
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-            }
 
-            Button(model.isCalibrating ? "Calibrating…" : "Calibrate") {
-                model.calibrate()
+                Button("Quit") {
+                    model.turnOff()
+                    NSApp.terminate(nil)
+                }
             }
-            .disabled(!model.isOn || model.isCalibrating)
-
-            Button("Quit") {
-                model.turnOff()
-                NSApp.terminate(nil)
-            }
+            .padding(16)
         }
-        .padding(16)
-        .frame(width: 360)
+        .frame(width: 380)
     }
 
-    private static func cutsLine(_ name: String, _ cut: BandCut) -> String {
-        "\(name)  lows \(Self.decibels(cut.lowDB))  mids \(Self.decibels(cut.midDB))  highs \(Self.decibels(cut.highDB))"
-    }
-
-    private static func decibels(_ value: Float) -> String {
-        let rounded = Int(value.rounded())
-        return "\(rounded) dB"
-    }
-
-    private func volume(_ title: String, value: Double, set: @escaping (Double) -> Void) -> some View {
+    private func speakerRow(_ speaker: SpeakerRecord) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(title)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(speaker.name)
+                    if !speaker.available {
+                        Text("Not connected")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Spacer()
-                Text("\(Int((value * 100).rounded()))%")
+                Button("Remove") {
+                    model.removeSpeaker(speaker.id)
+                }
+                .disabled(model.isOn || model.isBusy || model.isCalibrating)
+            }
+            HStack {
+                Text("Volume")
+                Spacer()
+                Text("\(Int((speaker.volume * 100).rounded()))%")
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
-            .font(.callout)
-            Slider(value: Binding(get: { value }, set: set), in: 0...1)
+            .font(.caption)
+            Slider(
+                value: Binding(
+                    get: { speaker.volume },
+                    set: { model.setVolume(speaker.id, $0) }
+                ),
+                in: 0...1
+            )
         }
+    }
+
+    private static func cutsLine(_ name: String, _ cut: BandCut) -> String {
+        "\(name)  lows \(decibels(cut.lowDB))  mids \(decibels(cut.midDB))  highs \(decibels(cut.highDB))"
+    }
+
+    private static func decibels(_ value: Float) -> String {
+        "\(Int(value.rounded())) dB"
     }
 }
 
@@ -345,7 +414,6 @@ final class StatusBarController: NSObject {
         self.model = model
         super.init()
         installStatusItem()
-        showWindow()
         cancellable = model.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { self?.updateIcon() }
         }
@@ -359,7 +427,7 @@ final class StatusBarController: NSObject {
 
         if let button = item.button {
             button.title = "Sync"
-            button.image = NSImage(systemSymbolName: "speaker.wave.2", accessibilityDescription: "Sound Sync")
+            button.image = Self.menuImage()
             button.imagePosition = .imageLeading
             button.action = #selector(showWindow)
             button.target = self
@@ -375,7 +443,7 @@ final class StatusBarController: NSObject {
             window.title = "Sound Sync"
             window.styleMask = [.titled, .closable, .miniaturizable]
             window.isReleasedWhenClosed = false
-            window.setContentSize(NSSize(width: 360, height: 420))
+            window.setContentSize(NSSize(width: 380, height: 560))
             self.window = window
         }
         if let window {
@@ -392,13 +460,21 @@ final class StatusBarController: NSObject {
                 ))
             }
         }
-        NSApp.setActivationPolicy(.regular)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    private static func menuImage() -> NSImage {
+        if let url = Bundle.main.url(forResource: "MenuBarIcon", withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            image.isTemplate = true
+            image.size = NSSize(width: 18, height: 18)
+            return image
+        }
+        return NSImage(systemSymbolName: "speaker.wave.2", accessibilityDescription: "Sound Sync") ?? NSImage()
+    }
+
     private func updateIcon() {
-        let name = model.isOn ? "speaker.wave.2.fill" : "speaker.wave.2"
-        item?.button?.image = NSImage(systemSymbolName: name, accessibilityDescription: "Sound Sync")
+        item?.button?.image = Self.menuImage()
     }
 }

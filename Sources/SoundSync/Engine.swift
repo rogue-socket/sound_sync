@@ -90,10 +90,20 @@ final class MicrophoneRecorder {
     }
 }
 
+struct SpeakerSetup {
+    var id: String
+    var name: String
+    var address: String?
+    var gain: Float
+    var delay: Double
+    var cut: BandCut
+}
+
 enum EngineError: Error, LocalizedError, CustomStringConvertible {
-    case notPaired
+    case notPaired(String)
+    case needTwoSpeakers
     case connectionFailed(String, Int32)
-    case speakersMissing(String)
+    case speakersMissing(String, String)
     case noMicrophone
     case cancelled
     case chirpFailed(String)
@@ -103,12 +113,14 @@ enum EngineError: Error, LocalizedError, CustomStringConvertible {
 
     var description: String {
         switch self {
-        case .notPaired:
-            return "Pair the Pulse 4 and the SRS-XB13 in Bluetooth settings first."
+        case .notPaired(let name):
+            return "\(name) isn't paired. Pair it in Bluetooth settings, then try again."
+        case .needTwoSpeakers:
+            return "Check at least two speakers. Sync needs more than one."
         case .connectionFailed(let name, let code):
-            return "Couldn't connect to \(name) (\(code)). Turn both speakers on and try again."
-        case .speakersMissing(let seen):
-            return "Both speakers need to be on. Currently visible outputs: \(seen)."
+            return "Couldn't connect to \(name) (\(code)). Turn that speaker on and try again."
+        case .speakersMissing(let missing, let seen):
+            return "\(missing) didn't show up as audio outputs. Turn them on. Currently visible: \(seen)."
         case .noMicrophone:
             return "The MacBook microphone isn't available."
         case .cancelled:
@@ -116,46 +128,49 @@ enum EngineError: Error, LocalizedError, CustomStringConvertible {
         case .chirpFailed(let detail):
             return detail
         case .speakersDisconnected(let missing):
-            return "Connect both speakers before calibrating. Missing: \(missing)."
+            return "Connect these speakers before calibrating: \(missing)."
         }
     }
 }
 
 final class Engine {
+    private struct ActiveSpeaker {
+        var id: String
+        var name: String
+        var output: SpeakerOutput
+        var trim: Float
+        var delay: Double
+        var cut: BandCut
+    }
+
     private let clock = SharedClock()
     private var tap: SystemAudioTap?
-    private var pulse: SpeakerOutput?
-    private var sony: SpeakerOutput?
+    private var speakers: [ActiveSpeaker] = []
+    private var wanted: [SpeakerSetup] = []
     private var microphone: MicrophoneRecorder?
     private var restoreOutputUID: String?
     private var startToken = UUID()
     private var volumeMonitor: OutputVolumeMonitor?
-    private var pulseTrim: Float = 0.8
-    private var sonyTrim: Float = 1
     private var master: Float = 1
     var onMasterVolume: ((Float) -> Void)?
-    private var pulseDelay = 0.0
-    private var sonyDelay = 0.0
-    private var pulseCut = BandCut.flat
-    private var sonyCut = BandCut.flat
     private var toneEnabled = true
     private let measuring = Atomic<Bool>(false)
     private var silenceRecheckEnabled = false
     private var reportedMissing = Set<String>()
     var onNotice: ((EngineNotice) -> Void)?
 
-    var measuredDelays: (pulse: Double, sony: Double) { (pulseDelay, sonyDelay) }
-
-    func start(pulseGain: Float, sonyGain: Float, pulseDelay: Double, sonyDelay: Double, pulseCut: BandCut, sonyCut: BandCut, toneEnabled: Bool, silenceRecheck: Bool) async throws {
+    func start(_ setups: [SpeakerSetup], toneEnabled: Bool, silenceRecheck: Bool) async throws {
+        guard setups.count >= 2 else { throw EngineError.needTwoSpeakers }
         let previous = try AudioDevices.defaultOutputUID()
         restoreOutputUID = previous
         UserDefaults.standard.set(previous, forKey: Store.restoreOutput)
+        wanted = setups
 
         do {
             try await Task.detached(priority: .userInitiated) {
-                try BluetoothSpeakers.connectPair()
+                try BluetoothSpeakers.connect(setups)
             }.value
-            let speakers = try await waitForSpeakers()
+            let devices = try await waitForSpeakers(setups)
             if let previousID = AudioDevices.deviceID(forUID: previous) {
                 try AudioDevices.setDefaultOutput(previousID)
                 startVolumeMonitor(on: previousID)
@@ -163,27 +178,24 @@ final class Engine {
             let tap = SystemAudioTap(clock: clock)
             try tap.start(mute: .mutedWhenTapped)
             self.tap = tap
-
-            let pulse = SpeakerOutput(device: speakers.pulse, clock: clock)
-            try pulse.start()
-            self.pulse = pulse
-            pulseTrim = pulseGain
-            pulse.reader.setDelay(pulseDelay)
-
-            let sony = SpeakerOutput(device: speakers.sony, clock: clock)
-            try sony.start()
-            self.sony = sony
-            sonyTrim = sonyGain
-            sony.reader.setDelay(sonyDelay)
-            applyGains()
-            self.pulseDelay = pulseDelay
-            self.sonyDelay = sonyDelay
-            self.pulseCut = pulseCut
-            self.sonyCut = sonyCut
             self.toneEnabled = toneEnabled
             self.silenceRecheckEnabled = silenceRecheck
-            pulse.setTone(toneEnabled ? pulseCut : .flat)
-            sony.setTone(toneEnabled ? sonyCut : .flat)
+            speakers = []
+            for (setup, device) in zip(setups, devices) {
+                let output = SpeakerOutput(device: device, clock: clock)
+                try output.start()
+                output.reader.setDelay(setup.delay)
+                output.setTone(toneEnabled ? setup.cut : .flat)
+                speakers.append(ActiveSpeaker(
+                    id: setup.id,
+                    name: setup.name,
+                    output: output,
+                    trim: setup.gain,
+                    delay: setup.delay,
+                    cut: setup.cut
+                ))
+            }
+            applyGains()
             let token = UUID()
             startToken = token
             let uid = previous
@@ -207,12 +219,13 @@ final class Engine {
         reportedMissing = []
         volumeMonitor?.stop()
         volumeMonitor = nil
-        pulse?.stop()
-        sony?.stop()
+        for speaker in speakers {
+            speaker.output.stop()
+        }
+        speakers = []
+        wanted = []
         microphone?.stop()
         tap?.stop()
-        pulse = nil
-        sony = nil
         microphone = nil
         tap = nil
         if let restoreOutputUID, let device = AudioDevices.deviceID(forUID: restoreOutputUID) {
@@ -222,30 +235,24 @@ final class Engine {
         restoreOutputUID = nil
     }
 
-    func setGains(pulse: Float, sony: Float) {
-        pulseTrim = pulse
-        sonyTrim = sony
+    func setGain(id: String, gain: Float) {
+        guard let index = speakers.firstIndex(where: { $0.id == id }) else { return }
+        speakers[index].trim = gain
         applyGains()
     }
 
     func setToneEnabled(_ enabled: Bool) {
         toneEnabled = enabled
-        pulse?.setTone(enabled ? pulseCut : .flat)
-        sony?.setTone(enabled ? sonyCut : .flat)
+        for speaker in speakers {
+            speaker.output.setTone(enabled ? speaker.cut : .flat)
+        }
     }
 
     func requireConnectedSpeakers() throws {
-        guard let pulse, let sony else { throw EngineError.cancelled }
-        var missing: [String] = []
-        let outputs = AudioDevices.outputs()
-        if !outputs.contains(where: { $0.uid == pulse.device.uid }) {
-            missing.append("Pulse 4")
-        }
-        if !outputs.contains(where: { $0.uid == sony.device.uid }) {
-            missing.append("SRS-XB13")
-        }
+        guard !speakers.isEmpty else { throw EngineError.cancelled }
+        let missing = missingSpeakerNames()
         if !missing.isEmpty {
-            throw EngineError.speakersDisconnected(missing.joined(separator: " and "))
+            throw EngineError.speakersDisconnected(SpeakerNames.list(missing))
         }
     }
 
@@ -254,63 +261,73 @@ final class Engine {
             try await Task.sleep(for: .milliseconds(200))
         }
         defer { measuring.store(false, ordering: .releasing) }
-        guard let pulse, let sony else { throw EngineError.cancelled }
+        guard speakers.count >= 2 else { throw EngineError.cancelled }
         try requireConnectedSpeakers()
+        let names = SpeakerNames.list(speakers.map(\.name))
         await progress(
             "Checking speakers",
-            "The Pulse 4 and the SRS-XB13 are both connected."
+            "\(names) are connected."
         )
         let microphone = MicrophoneRecorder()
         self.microphone = microphone
         defer {
             microphone.stop()
             self.microphone = nil
-            pulse.resume()
-            sony.resume()
+            for speaker in speakers {
+                speaker.output.resume()
+            }
+        }
+        var results: [(latency: Double, shape: BandLevel)] = []
+        for index in speakers.indices {
+            let name = speakers[index].name
+            await progress(
+                "Testing \(name)",
+                "Playing a sweep through \(name). The Mac microphone is listening for delay and tone. That speaker is turned up for the test, then put back."
+            )
+            let others = speakers.enumerated().filter { $0.offset != index }.map(\.element.output)
+            let result = try await measure(speaker: speakers[index].output, others: others, microphone: microphone, name: name)
+            results.append(result)
         }
         await progress(
-            "Testing the Pulse 4",
-            "Playing a sweep through the Pulse 4. The Mac microphone is listening for delay and tone. That speaker is turned up for the test, then put back."
-        )
-        let pulseResult = try await measure(speaker: pulse, other: sony, microphone: microphone, name: "Pulse 4")
-        await progress(
-            "Testing the SRS-XB13",
-            "Playing a sweep through the SRS-XB13. The Mac microphone is listening for delay and tone. That speaker is turned up for the test, then put back."
-        )
-        let sonyResult = try await measure(speaker: sony, other: pulse, microphone: microphone, name: "SRS-XB13")
-        await progress(
-            "Comparing the two",
+            "Comparing speakers",
             "Setting the delay, and sending each part of the sound to the speaker that reproduces it better."
         )
-        let slowest = max(pulseResult.latency, sonyResult.latency)
-        pulseDelay = max(0, slowest - pulseResult.latency)
-        sonyDelay = max(0, slowest - sonyResult.latency)
-        pulse.reader.setDelay(pulseDelay)
-        sony.reader.setDelay(sonyDelay)
-        let cuts = ToneSplit.assignment(pulse: pulseResult.shape, sony: sonyResult.shape)
-        pulseCut = cuts.pulse
-        sonyCut = cuts.sony
+        let slowest = results.map(\.latency).max() ?? 0
+        let cuts = ToneSplit.cuts(for: results.map(\.shape))
+        var measured: [SpeakerMeasurement] = []
+        for index in speakers.indices {
+            let delay = max(0, slowest - results[index].latency)
+            speakers[index].delay = delay
+            speakers[index].cut = cuts[index]
+            speakers[index].output.reader.setDelay(delay)
+            speakers[index].output.setTone(toneEnabled ? cuts[index] : .flat)
+            if let wantedIndex = wanted.firstIndex(where: { $0.id == speakers[index].id }) {
+                wanted[wantedIndex].delay = delay
+                wanted[wantedIndex].cut = cuts[index]
+            }
+            measured.append(SpeakerMeasurement(
+                id: speakers[index].id,
+                name: speakers[index].name,
+                delay: delay,
+                cut: cuts[index]
+            ))
+        }
         silenceRecheckEnabled = true
-        pulse.setTone(toneEnabled ? cuts.pulse : .flat)
-        sony.setTone(toneEnabled ? cuts.sony : .flat)
-        return Calibration(
-            pulseDelay: pulseDelay,
-            sonyDelay: sonyDelay,
-            pulseCut: cuts.pulse,
-            sonyCut: cuts.sony
-        )
+        return Calibration(speakers: measured)
     }
 
     private func measure(
         speaker: SpeakerOutput,
-        other: SpeakerOutput,
+        others: [SpeakerOutput],
         microphone: MicrophoneRecorder,
         name: String
     ) async throws -> (latency: Double, shape: BandLevel) {
         microphone.stop()
         try microphone.start()
         try await Task.sleep(for: .milliseconds(100))
-        other.silence()
+        for other in others {
+            other.silence()
+        }
         let savedLevel = DeviceLevel.boost(speaker.device.id)
         defer { DeviceLevel.restore(speaker.device.id, savedLevel) }
         let playback = Chirp.make(sampleRate: speaker.sampleRate)
@@ -319,7 +336,9 @@ final class Engine {
         let listen = Chirp.duration + 0.9
         try await Task.sleep(for: .milliseconds(Int(listen * 1_000)))
         speaker.silence()
-        other.silence()
+        for other in others {
+            other.silence()
+        }
 
         let recording = microphone.snapshot()
         guard recording.startHost != 0 else {
@@ -361,15 +380,23 @@ final class Engine {
         throw EngineError.chirpFailed("\(speaker.device.name) didn't play the chirp.")
     }
 
-    private func waitForSpeakers() async throws -> (pulse: AudioDeviceInfo, sony: AudioDeviceInfo) {
+    private func waitForSpeakers(_ setups: [SpeakerSetup]) async throws -> [AudioDeviceInfo] {
+        let names = setups.map(\.name)
         for _ in 0..<24 {
-            if let match = AudioDevices.matchSpeakers() {
+            if let match = AudioDevices.matchBluetooth(names: names) {
                 return match
             }
             try await Task.sleep(for: .milliseconds(500))
         }
-        let names = AudioDevices.outputs().map(\.name).joined(separator: ", ")
-        throw EngineError.speakersMissing(names.isEmpty ? "none" : names)
+        let present = AudioDevices.bluetoothOutputs()
+        let missing = names.filter { name in
+            !present.contains { SpeakerNames.match($0.name, name) }
+        }
+        let seen = AudioDevices.outputs().map(\.name).joined(separator: ", ")
+        throw EngineError.speakersMissing(
+            SpeakerNames.list(missing.isEmpty ? names : missing),
+            seen.isEmpty ? "none" : seen
+        )
     }
 
     private func startVolumeMonitor(on device: AudioDeviceID) {
@@ -386,8 +413,9 @@ final class Engine {
     }
 
     private func applyGains() {
-        pulse?.reader.setGain(pulseTrim * master)
-        sony?.reader.setGain(sonyTrim * master)
+        for speaker in speakers {
+            speaker.output.reader.setGain(speaker.trim * master)
+        }
     }
 
     private func startWatch(token: UUID) {
@@ -423,15 +451,10 @@ final class Engine {
     }
 
     private func missingSpeakerNames() -> [String] {
-        let outputs = AudioDevices.outputs()
-        var missing: [String] = []
-        if let pulse, !outputs.contains(where: { $0.uid == pulse.device.uid }) {
-            missing.append("Pulse 4")
+        let outputs = AudioDevices.bluetoothOutputs()
+        return speakers.compactMap { speaker in
+            outputs.contains { $0.uid == speaker.output.device.uid } ? nil : speaker.name
         }
-        if let sony, !outputs.contains(where: { $0.uid == sony.device.uid }) {
-            missing.append("SRS-XB13")
-        }
-        return missing
     }
 
     private func recoverDisconnectedSpeakers() async -> Bool {
@@ -441,25 +464,21 @@ final class Engine {
             reportedMissing.insert(name)
             onNotice?(.speakerLost(name))
         }
+        let setups = wanted
         try? await Task.detached(priority: .userInitiated) {
-            try BluetoothSpeakers.connectPair()
+            try BluetoothSpeakers.connect(setups)
         }.value
         for _ in 0..<12 {
-            guard let match = AudioDevices.matchSpeakers() else {
+            guard let match = AudioDevices.matchBluetooth(names: setups.map(\.name)) else {
                 try? await Task.sleep(for: .milliseconds(500))
                 continue
             }
             var restored = false
-            if missing.contains("Pulse 4") {
-                adopt(match.pulse, kind: .pulse)
-                reportedMissing.remove("Pulse 4")
-                onNotice?(.speakerBack("Pulse 4"))
-                restored = true
-            }
-            if missing.contains("SRS-XB13") {
-                adopt(match.sony, kind: .sony)
-                reportedMissing.remove("SRS-XB13")
-                onNotice?(.speakerBack("SRS-XB13"))
+            for (setup, device) in zip(setups, match) {
+                guard missing.contains(setup.name) else { continue }
+                guard adopt(device, id: setup.id) else { continue }
+                reportedMissing.remove(setup.name)
+                onNotice?(.speakerBack(setup.name))
                 restored = true
             }
             return restored
@@ -467,47 +486,61 @@ final class Engine {
         return false
     }
 
-    private func adopt(_ info: AudioDeviceInfo, kind: SpeakerKind) {
-        let previous = kind == .pulse ? pulse : sony
-        previous?.stop()
+    private func adopt(_ info: AudioDeviceInfo, id: String) -> Bool {
+        guard let index = speakers.firstIndex(where: { $0.id == id }) else { return false }
+        if speakers[index].output.device.uid == info.uid { return true }
+        speakers[index].output.stop()
         let output = SpeakerOutput(device: info, clock: clock)
         do {
             try output.start()
         } catch {
-            return
+            return false
         }
-        let delay = kind == .pulse ? pulseDelay : sonyDelay
-        let cut = kind == .pulse ? pulseCut : sonyCut
+        let delay = speakers[index].delay
+        let cut = speakers[index].cut
         output.reader.setDelay(delay)
         output.setTone(toneEnabled ? cut : .flat)
-        if kind == .pulse {
-            pulse = output
-        } else {
-            sony = output
-        }
+        speakers[index].output = output
         applyGains()
+        return true
     }
 
     private func recheckDelay() async {
-        guard let pulse, let sony else { return }
+        guard speakers.count >= 2 else { return }
         onNotice?(.rechecking)
         let microphone = MicrophoneRecorder()
         self.microphone = microphone
         defer {
             microphone.stop()
             self.microphone = nil
-            pulse.resume()
-            sony.resume()
+            for speaker in speakers {
+                speaker.output.resume()
+            }
         }
         do {
-            let pulseResult = try await measure(speaker: pulse, other: sony, microphone: microphone, name: "Pulse 4")
-            let sonyResult = try await measure(speaker: sony, other: pulse, microphone: microphone, name: "SRS-XB13")
-            let slowest = max(pulseResult.latency, sonyResult.latency)
-            pulseDelay = max(0, slowest - pulseResult.latency)
-            sonyDelay = max(0, slowest - sonyResult.latency)
-            pulse.reader.setDelay(pulseDelay)
-            sony.reader.setDelay(sonyDelay)
-            onNotice?(.delaysUpdated(pulse: pulseDelay, sony: sonyDelay))
+            var latencies: [Double] = []
+            for index in speakers.indices {
+                let others = speakers.enumerated().filter { $0.offset != index }.map(\.element.output)
+                let result = try await measure(
+                    speaker: speakers[index].output,
+                    others: others,
+                    microphone: microphone,
+                    name: speakers[index].name
+                )
+                latencies.append(result.latency)
+            }
+            let slowest = latencies.max() ?? 0
+            var updates: [(id: String, delay: Double)] = []
+            for index in speakers.indices {
+                let delay = max(0, slowest - latencies[index])
+                speakers[index].delay = delay
+                speakers[index].output.reader.setDelay(delay)
+                if let wantedIndex = wanted.firstIndex(where: { $0.id == speakers[index].id }) {
+                    wanted[wantedIndex].delay = delay
+                }
+                updates.append((speakers[index].id, delay))
+            }
+            onNotice?(.delaysUpdated(updates))
         } catch {
             onNotice?(.recheckFailed(error.localizedDescription))
         }
@@ -528,26 +561,26 @@ enum Store {
     static let sonyMid = "sonyMidDB"
     static let sonyHigh = "sonyHighDB"
     static let toneEnabled = "toneEnabled"
+    static let speakerRecords = "speakerRecords"
+}
+
+struct SpeakerMeasurement {
+    var id: String
+    var name: String
+    var delay: Double
+    var cut: BandCut
 }
 
 struct Calibration {
-    var pulseDelay: Double
-    var sonyDelay: Double
-    var pulseCut: BandCut
-    var sonyCut: BandCut
+    var speakers: [SpeakerMeasurement]
 }
 
 enum EngineNotice {
     case rechecking
-    case delaysUpdated(pulse: Double, sony: Double)
+    case delaysUpdated([(id: String, delay: Double)])
     case recheckFailed(String)
     case speakerLost(String)
     case speakerBack(String)
-}
-
-private enum SpeakerKind {
-    case pulse
-    case sony
 }
 
 enum OutputRestore {

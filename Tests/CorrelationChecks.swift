@@ -38,14 +38,14 @@ enum ToneChecks {
         let sony = mix(rate: rate, lows: 0.08, mids: 0.25, highs: 1)
         let pulseShape = ToneSplit.shape(samples: pulse, sampleRate: rate)
         let sonyShape = ToneSplit.shape(samples: sony, sampleRate: rate)
-        let cuts = ToneSplit.assignment(pulse: pulseShape, sony: sonyShape)
-        if cuts.sony.lowDB >= -1 {
-            throw CheckFailure("expected the weaker low end to be turned down, sony low cut was \(cuts.sony.lowDB)")
+        let cuts = ToneSplit.cuts(for: [pulseShape, sonyShape])
+        if cuts[1].lowDB >= -1 {
+            throw CheckFailure("expected the weaker low end to be turned down, sony low cut was \(cuts[1].lowDB)")
         }
-        if cuts.pulse.highDB >= -1 {
-            throw CheckFailure("expected the weaker high end to be turned down, pulse high cut was \(cuts.pulse.highDB)")
+        if cuts[0].highDB >= -1 {
+            throw CheckFailure("expected the weaker high end to be turned down, pulse high cut was \(cuts[0].highDB)")
         }
-        if cuts.pulse.lowDB != 0 || cuts.sony.highDB != 0 {
+        if cuts[0].lowDB != 0 || cuts[1].highDB != 0 {
             throw CheckFailure("the stronger band should stay untouched")
         }
         var eq = Biquad()
@@ -57,7 +57,7 @@ enum ToneChecks {
         if sawNan || abs(eq.process(0.2) - 0.2) > 0.001 {
             throw CheckFailure("a flat filter changed the signal")
         }
-        print("tone split ok (sony lows \(cuts.sony.lowDB) dB, pulse highs \(cuts.pulse.highDB) dB)")
+        print("tone split ok (sony lows \(cuts[1].lowDB) dB, pulse highs \(cuts[0].highDB) dB)")
     }
 
     private static func mix(rate: Double, lows: Float, mids: Float, highs: Float) -> [Float] {

@@ -36,16 +36,6 @@ struct AudioDeviceInfo: Identifiable, Equatable {
     var uid: String
     var name: String
     var outputChannels: Int
-
-    var isPulse: Bool {
-        let lower = name.lowercased()
-        return lower.contains("pulse")
-    }
-
-    var isSony: Bool {
-        let lower = name.lowercased()
-        return lower.contains("xb13")
-    }
 }
 
 enum AudioDevices {
@@ -60,14 +50,21 @@ enum AudioDevices {
         }
     }
 
-    static func matchSpeakers() -> (pulse: AudioDeviceInfo, sony: AudioDeviceInfo)? {
-        let devices = outputs()
-        guard let pulse = devices.filter(\.isPulse).sorted(by: { $0.name.count > $1.name.count }).first,
-              let sony = devices.filter(\.isSony).first,
-              pulse.id != sony.id else {
-            return nil
+    static func bluetoothOutputs() -> [AudioDeviceInfo] {
+        outputs().filter { isBluetooth($0.id) }
+    }
+
+    /// Match each name to a distinct Bluetooth output. Names are the speaker's Bluetooth name.
+    static func matchBluetooth(names: [String]) -> [AudioDeviceInfo]? {
+        var pool = bluetoothOutputs()
+        var matched: [AudioDeviceInfo] = []
+        for name in names {
+            guard let index = pool.firstIndex(where: { SpeakerNames.match($0.name, name) }) else {
+                return nil
+            }
+            matched.append(pool.remove(at: index))
         }
-        return (pulse, sony)
+        return matched
     }
 
     static func defaultOutputUID() throws -> String {
@@ -160,6 +157,20 @@ enum AudioDevices {
         )
         try AudioObjectGetPropertyData(device, &address, 0, nil, &size, &rate).check("Read sample rate")
         return rate
+    }
+
+    private static func isBluetooth(_ id: AudioDeviceID) -> Bool {
+        var transport = UInt32(0)
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &transport) == noErr else {
+            return false
+        }
+        return transport == kAudioDeviceTransportTypeBluetooth || transport == kAudioDeviceTransportTypeBluetoothLE
     }
 
     private static func deviceIDs() -> [AudioDeviceID] {
