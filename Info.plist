@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>SoundSync</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.yashagrawal.soundsync</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Sound Sync</string>
+	<key>CFBundleDisplayName</key>
+	<string>Sound Sync</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.2</string>
+	<key>LSUIElement</key>
+	<false/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Sound Sync connects to the Pulse 4 and the SRS-XB13 so it can play audio on both.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Sound Sync listens for a test chirp to measure how long each speaker takes to play.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Sound Sync captures audio playing on this Mac so it can send that audio to both speakers.</string>
+</dict>
+</plist>
